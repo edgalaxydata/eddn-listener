@@ -12,6 +12,7 @@ from datetime import datetime
 import os
 import os.path
 import re
+import math
 import signal
 from urllib.parse import quote
 import logging
@@ -247,10 +248,11 @@ def listen(subscriber, timeout, eddndir):
     last_recv_msec = time.monotonic_ns() // 1000000
     last_stat_msec = last_recv_msec
     line_count = 0
-    message_types_last_read = 0
+    message_types_last_read = -math.inf
 
     while True:
         if time.monotonic() > message_types_last_read + 300:
+            logger.info('Reading message types')
             message_types_last_read = time.monotonic()
             read_message_types(eddndir)
 
