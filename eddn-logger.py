@@ -10,7 +10,7 @@ import os
 import os.path
 import re
 import signal
-import urllib.parse
+from urllib.parse import quote
 import logging
 from logging.handlers import TimedRotatingFileHandler
 
@@ -20,8 +20,6 @@ TIMEOUT = 60000
 SCHEMABASE = 'https://eddn.edcd.io/schemas/'
 EDDNDIR = '/srv/EDDN/data'
 LOGPREFIX = '/srv/EDDN/log/eddn-live'
-GWTS_REGEX = re.compile('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}')
-
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +52,16 @@ message_types = {
 
 message_types_last_read = 0
 
+gwts_regex = re.compile(
+    '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}'
+)
+msgevent_regex = re.compile(
+    '^[A-Z][A-Za-z]*$'
+)
+eventtype_regex = re.compile(
+    '^[A-Z][A-Za-z0-9._-]*[A-Za-z0-9]$'
+)
+
 
 def restart():
     logger.warning('Restarting on USR1')
@@ -65,31 +73,30 @@ def handle_usr1(signum, stack):
 
 
 def process_msg(eddndir, msgtype, msg, msgraw):
-    global eddnfiles
-    global eddnfilenames
-
     print(msgraw.decode('utf-8'))
     sys.stdout.flush()
 
     gwts = msg.get('header', {}).get('gatewayTimestamp')
 
-    if gwts is None or not GWTS_REGEX.match(gwts):
+    if gwts is None or not gwts_regex.match(gwts):
+        logger.warning('Unrecognised gateway timestamp %s', gwts)
         gwts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
 
     evttype = msg.get('message', {}).get('event')
 
     if msgtype not in ['Journal', 'Test-Journal']:
-        eventtype = msgtype
+        eventtype = quote(msgtype)
     elif evttype is not None:
-        eventtype = msgtype + '.' + evttype
+        eventtype = quote(msgtype + '.' + evttype)
     else:
         eventtype = 'Unknown'
 
-    eddnname = f'{eddndir}/{urllib.parse.quote(eventtype)}-{gwts[0:10]}.jsonl'
+    eddnname = f'{eddndir}/{eventtype}-{gwts[0:10]}.jsonl'
 
     eddnfile = eddnfiles.get(eventtype)
+    prevname = eddnfilenames.get(eventtype, '')
 
-    if eddnfile is not None and eddnfilenames.get(eventtype, '') != eddnname:
+    if eddnfile is not None and prevname != eddnname:
         eddnfile.close()
         eddnfile = None
 
@@ -103,14 +110,55 @@ def process_msg(eddndir, msgtype, msg, msgraw):
     eddnfile.flush()
 
 
-def read_message_types(eddndir):
+def process_raw_msg(eddndir, message):
     try:
-        message_types_last_read = time.monotonic()
-        with open(eddndir + '/msgtypes.txt', 'r', encoding='utf-8') as f:
-            for l in f:
-                schema, msgtype = l.strip().split()
-                if schema.startswith(SCHEMABASE) and re.fullmatch('[A-Z][A-Za-z0-9._-]*[A-Za-z0-9]', msgtype):
-                    message_types[schema] = msgtype
+        message = zlib.decompress(message)
+    except Exception:
+        logger.exception(
+            "Unable to decompress event",
+            extra={'data': message.hex()}
+        )
+
+        return
+
+    try:
+        msg = message.decode('utf-8').strip()
+    except Exception:
+        logger.exception(
+            "Unparseable event",
+            extra={'data': message.decode('latin1')}
+        )
+        return
+
+    try:
+        msg = json.loads(msg)
+    except Exception:
+        logger.exception("Unparseable event: %s", msg)
+        return
+
+    schemaRef = msg.get('$schemaRef', '-')
+    msgtype = message_types.get(schemaRef, 'Unknown')
+
+    try:
+        process_msg(eddndir, msgtype, msg, message)
+    except AttributeError:
+        logger.exception("Unhandled event: %s", json.dumps(msg))
+
+
+def update_message_types(file):
+    for line in file:
+        schema, msgtype = line.strip().split()
+        if schema.startswith(SCHEMABASE) and eventtype_regex.match(msgtype):
+            message_types[schema] = msgtype
+
+
+def read_message_types(eddndir):
+    global message_types_last_read
+    message_types_last_read = time.monotonic()
+
+    try:
+        with open(eddndir + '/msgtypes.txt', 'r', encoding='utf-8') as file:
+            update_message_types(file)
     except Exception:
         pass
 
@@ -126,7 +174,10 @@ def setup_logging(logprefix):
 
     handler.suffix = "%Y-%m-%d"
 
-    formatter = logging.Formatter("[%(asctime)s][%(levelname)s][%(name)s] %(message)s")
+    formatter = logging.Formatter(
+        "[%(asctime)s][%(levelname)s][%(name)s] %(message)s"
+    )
+
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
@@ -139,7 +190,7 @@ def main():
 
     try:
         timeout = int(os.environ.get('EDDN_TIMEOUT')) or TIMEOUT
-    except:
+    except Exception:
         timeout = TIMEOUT
 
     setup_logging(logprefix)
@@ -160,38 +211,14 @@ def main():
 
                 message = subscriber.recv()
 
-                if message == False:
-                    logger.warning("subscriber.recv() returned False")
+                if not message:
+                    logger.warning("subscriber.recv() returned nothing")
                     subscriber.disconnect(relay)
                     break
 
                 signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGUSR1,))
 
-                try:
-                    message = zlib.decompress(message)
-                except:
-                    logger.exception("Unable to decompress event", extra={ 'data': data.hex() })
-                    continue
-
-                try:
-                    msg = message.decode('utf-8').strip()
-                except:
-                    logger.exception("Unparseable event", extra={ 'data': data.decode('latin1') })
-                    continue
-                
-                try:
-                    msg = json.loads(msg)
-                except:
-                    logger.exception("Unparseable event: %s", msg)
-                    continue
-
-                schemaRef = msg.get('$schemaRef', '-')
-                msgtype = message_types.get(schemaRef, 'Unknown')
-
-                try:
-                    process_msg(eddndir, msgtype, msg, message)
-                except AttributeError:
-                    logger.exception("Unhandled event: %s", json.dumps(msg))
+                process_raw_msg(eddndir, message)
 
                 signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGUSR1,))
 
