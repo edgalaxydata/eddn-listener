@@ -12,7 +12,7 @@ import re
 import signal
 from urllib.parse import quote
 import logging
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler, StreamHandler
 
 
 RELAY = 'tcp://eddn.edcd.io:9500'
@@ -164,7 +164,7 @@ def read_message_types(eddndir):
 
 
 def setup_logging(logprefix):
-    handler = TimedRotatingFileHandler(
+    fileHandler = TimedRotatingFileHandler(
         filename=logprefix + ".log",
         when="midnight",
         interval=1,
@@ -172,14 +172,20 @@ def setup_logging(logprefix):
         encoding="utf-8"
     )
 
-    handler.suffix = "%Y-%m-%d"
+    fileHandler.suffix = "%Y-%m-%d"
+
+    stderrHandler = StreamHandler(sys.stderr)
 
     formatter = logging.Formatter(
         "[%(asctime)s][%(levelname)s][%(name)s] %(message)s"
     )
 
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+    fileHandler.setFormatter(formatter)
+    stderrHandler.setFormatter(formatter)
+
+    logger.addHandler(fileHandler)
+    logger.addHandler(stderrHandler)
+
     logger.setLevel(logging.INFO)
 
 
