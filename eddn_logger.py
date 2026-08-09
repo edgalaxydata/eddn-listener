@@ -91,7 +91,7 @@ def process_msg(eddndir, msg):
     '''
 
     schema_ref = msg.get('$schemaRef', '-')
-    msgtype = message_types.get(schema_ref)
+    msgtype = message_types.get(schema_ref, 'Unknown')
 
     gwts = msg.get('header', {}).get('gatewayTimestamp')
 
