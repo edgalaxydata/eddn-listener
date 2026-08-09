@@ -74,9 +74,6 @@ def handle_usr1(signum, stack):
 
 
 def process_msg(eddndir, msgtype, msg, msgraw):
-    print(msgraw.decode('utf-8'))
-    sys.stdout.flush()
-
     gwts = msg.get('header', {}).get('gatewayTimestamp')
 
     if gwts is None or not gwts_regex.match(gwts):
@@ -214,23 +211,40 @@ def main():
     while True:
         try:
             subscriber.connect(relay)
+            last_recv_msec = time.monotonic_ns() // 1000000
+            last_stat_msec = last_recv_time
+            line_count = 0
 
             while True:
                 if time.monotonic() > message_types_last_read + 300:
                     read_message_types(eddndir)
 
-                message = subscriber.recv()
+                now_msec = time.monotonic_ns() // 1000000
 
-                if not message:
-                    logger.warning("subscriber.recv() returned nothing")
-                    subscriber.disconnect(relay)
+                while now_msec - last_stat_msec > 5000:
+                    if line_count > 0:
+                        logger.info("Received %d events", line_count)
+                        line_count = 0
+                    last_stat_msec += 5000
+
+                if subscriber.poll(last_stat_msec + 5000 - now_msec):
+                    last_recv_msec = now_msec
+                    line_count += 1
+                    message = subscriber.recv()
+
+                    if not message:
+                        logger.warning("subscriber.recv() returned nothing")
+                        subscriber.disconnect(relay)
+                        break
+
+                    signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGUSR1,))
+
+                    process_raw_msg(eddndir, message)
+
+                    signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGUSR1,))
+                elif now_msec - last_recv_msec > timeout:
+                    logger.error('No messages received')
                     break
-
-                signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGUSR1,))
-
-                process_raw_msg(eddndir, message)
-
-                signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGUSR1,))
 
         except zmq.ZMQError as e:
             logger.exception("ZMQ Error: %s", e)
