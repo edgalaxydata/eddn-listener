@@ -125,7 +125,7 @@ def process_msg(eddndir, msg):
     if eddnfile is None:
         eddnfilenames[eventtype] = eddnname
 
-        eddnfile = open( # pylint: disable=consider-using-with
+        eddnfile = open(  # pylint: disable=consider-using-with
             eddnfilenames[eventtype],
             'a',
             encoding='utf-8'
