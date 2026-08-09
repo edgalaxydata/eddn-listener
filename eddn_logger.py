@@ -68,6 +68,8 @@ eventtype_regex = re.compile(
     '^[A-Z][A-Za-z0-9._-]*[A-Za-z0-9]$'
 )
 
+signals = []
+
 
 def restart():
     '''
@@ -273,13 +275,13 @@ def listen(subscriber, timeout, eddndir):
                 logger.warning("subscriber.recv() returned nothing")
                 return
 
-            if hasattr(signal, 'SIGUSR1') and hasattr(signal, 'SIG_BLOCK'):
-                signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGUSR1,))
+            if hasattr(signal, 'SIG_BLOCK') and signals:
+                signal.pthread_sigmask(signal.SIG_BLOCK, signals)
 
             process_raw_msg(eddndir, message)
 
-            if hasattr(signal, 'SIGUSR1') and hasattr(signal, 'SIG_UNBLOCK'):
-                signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGUSR1,))
+            if hasattr(signal, 'SIG_UNBLOCK') and signals:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, signals)
         elif now_msec - last_recv_msec > timeout:
             logger.error('No messages received')
             return
@@ -300,6 +302,11 @@ def main():
         timeout = TIMEOUT
 
     setup_logging(logprefix)
+
+    if hasattr(signal, 'SIGUSR1'):
+        signals.append(signal.SIGUSR1)
+    if hasattr(signal, 'SIGINT'):
+        signals.append(signal.SIGINT)
 
     context = zmq.Context.instance()
     subscriber = context.socket(zmq.SUB)
@@ -323,8 +330,8 @@ def main():
 
         subscriber.disconnect(relay)
 
-        if hasattr(signal, 'SIGUSR1') and hasattr(signal, 'SIG_UNBLOCK'):
-            signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGUSR1,))
+        if hasattr(signal, 'SIG_UNBLOCK') and signals:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, signals)
 
         time.sleep(5)
 
