@@ -101,7 +101,16 @@ def process_msg(eddndir, msg):
 
     evttype = msg.get('message', {}).get('event')
 
-    if msgtype not in ['Journal', 'Test-Journal']:
+    if evttype is not None and not msgevent_regex.match(evttype):
+        evttype = None
+
+    if msgtype == 'Unknown':
+        logger.warning(
+            'Unrecognised schema %s',
+            schema_ref
+        )
+        eventtype = 'Unknown'
+    elif msgtype not in ['Journal', 'Test-Journal']:
         eventtype = quote(msgtype)
     elif evttype is not None:
         eventtype = quote(msgtype + '.' + evttype)
