@@ -73,7 +73,10 @@ def handle_usr1(signum, stack):
     restart()
 
 
-def process_msg(eddndir, msgtype, msg, msgraw):
+def process_msg(eddndir, msg):
+    schemaRef = msg.get('$schemaRef', '-')
+    msgtype = message_types.get(schemaRef)
+
     gwts = msg.get('header', {}).get('gatewayTimestamp')
 
     if gwts is None or not gwts_regex.match(gwts):
@@ -87,6 +90,7 @@ def process_msg(eddndir, msgtype, msg, msgraw):
     elif evttype is not None:
         eventtype = quote(msgtype + '.' + evttype)
     else:
+        logger.warning('Unrecognised schema / event %s / %s', schemaRef, evttype)
         eventtype = 'Unknown'
 
     eddnname = f'{eddndir}/{eventtype}-{gwts[0:10]}.jsonl'
@@ -134,11 +138,8 @@ def process_raw_msg(eddndir, message):
         logger.exception("Unparseable event: %s", msg)
         return
 
-    schemaRef = msg.get('$schemaRef', '-')
-    msgtype = message_types.get(schemaRef, 'Unknown')
-
     try:
-        process_msg(eddndir, msgtype, msg, message)
+        process_msg(eddndir, msg)
     except AttributeError:
         logger.exception("Unhandled event: %s", json.dumps(msg))
 
