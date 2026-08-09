@@ -317,6 +317,9 @@ def main():
 
         except zmq.ZMQError as e:
             logger.exception("ZMQ Error: %s", e)
+        except KeyboardInterrupt:
+            logger.warning("Exiting")
+            return
 
         subscriber.disconnect(relay)
 
