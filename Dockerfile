@@ -26,4 +26,6 @@ ENV EDDN_RELAY=tcp://eddn.edcd.io:9500
 ENV EDDN_DIR=/srv/EDDN/data
 ENV EDDN_LOGPREFIX=/srv/EDDN/log/eddn-live
 
+STOPSIGNAL SIGINT
+
 ENTRYPOINT [ "python", "/app/eddn_logger.py"]
