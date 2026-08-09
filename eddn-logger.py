@@ -113,7 +113,7 @@ def process_msg(eddndir, msgtype, msg, msgraw):
 def process_raw_msg(eddndir, message):
     try:
         message = zlib.decompress(message)
-    except Exception:
+    except (zlib.error, TypeError):
         logger.exception(
             "Unable to decompress event",
             extra={'data': message.hex()}
@@ -123,7 +123,7 @@ def process_raw_msg(eddndir, message):
 
     try:
         msg = message.decode('utf-8').strip()
-    except Exception:
+    except UnicodeError:
         logger.exception(
             "Unparseable event",
             extra={'data': message.decode('latin1')}
@@ -132,7 +132,7 @@ def process_raw_msg(eddndir, message):
 
     try:
         msg = json.loads(msg)
-    except Exception:
+    except json.JSONDecodeError:
         logger.exception("Unparseable event: %s", msg)
         return
 
@@ -147,9 +147,12 @@ def process_raw_msg(eddndir, message):
 
 def update_message_types(file):
     for line in file:
-        schema, msgtype = line.strip().split()
-        if schema.startswith(SCHEMABASE) and eventtype_regex.match(msgtype):
-            message_types[schema] = msgtype
+        try:
+            schema, msgtype = line.strip().split()
+            if schema.startswith(SCHEMABASE) and eventtype_regex.match(msgtype):
+                message_types[schema] = msgtype
+        except ValueError:
+            pass
 
 
 def read_message_types(eddndir):
@@ -159,7 +162,7 @@ def read_message_types(eddndir):
     try:
         with open(eddndir + '/msgtypes.txt', 'r', encoding='utf-8') as file:
             update_message_types(file)
-    except Exception:
+    except (IOError, UnicodeError):
         pass
 
 
@@ -196,7 +199,7 @@ def main():
 
     try:
         timeout = int(os.environ.get('EDDN_TIMEOUT')) or TIMEOUT
-    except Exception:
+    except (ValueError, TypeError):
         timeout = TIMEOUT
 
     setup_logging(logprefix)
