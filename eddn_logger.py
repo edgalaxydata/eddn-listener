@@ -1,7 +1,10 @@
 #!/usr/bin/python3
 
+'''
+EDDN logger
+'''
+
 import zlib
-import zmq
 import json
 import sys
 import time
@@ -14,6 +17,7 @@ from urllib.parse import quote
 import logging
 from logging import StreamHandler
 from logging.handlers import TimedRotatingFileHandler
+import zmq
 
 
 RELAY = 'tcp://eddn.edcd.io:9500'
@@ -51,31 +55,43 @@ message_types = {
     'https://eddn.edcd.io/schemas/blackmarket/1/beta': 'Beta-BlackMarket',
 }
 
-message_types_last_read = 0
-
 gwts_regex = re.compile(
     '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}'
 )
+
 msgevent_regex = re.compile(
     '^[A-Z][A-Za-z]*$'
 )
+
 eventtype_regex = re.compile(
     '^[A-Z][A-Za-z0-9._-]*[A-Za-z0-9]$'
 )
 
 
 def restart():
+    '''
+    Restart process on USR1 signal
+    '''
+
     logger.warning('Restarting on USR1')
     os.execv(sys.argv[0], sys.argv)
 
 
-def handle_usr1(signum, stack):
+def handle_usr1():
+    '''
+    Handle USR1 signal
+    '''
+
     restart()
 
 
 def process_msg(eddndir, msg):
-    schemaRef = msg.get('$schemaRef', '-')
-    msgtype = message_types.get(schemaRef)
+    '''
+    Process a single EDDN message
+    '''
+
+    schema_ref = msg.get('$schemaRef', '-')
+    msgtype = message_types.get(schema_ref)
 
     gwts = msg.get('header', {}).get('gatewayTimestamp')
 
@@ -90,7 +106,11 @@ def process_msg(eddndir, msg):
     elif evttype is not None:
         eventtype = quote(msgtype + '.' + evttype)
     else:
-        logger.warning('Unrecognised schema / event %s / %s', schemaRef, evttype)
+        logger.warning(
+            'Unrecognised schema / event %s / %s',
+            schema_ref,
+            evttype
+        )
         eventtype = 'Unknown'
 
     eddnname = f'{eddndir}/{eventtype}-{gwts[0:10]}.jsonl'
@@ -104,7 +124,13 @@ def process_msg(eddndir, msg):
 
     if eddnfile is None:
         eddnfilenames[eventtype] = eddnname
-        eddnfile = open(eddnfilenames[eventtype], 'a', encoding='utf-8')
+
+        eddnfile = open( # pylint: disable=consider-using-with
+            eddnfilenames[eventtype],
+            'a',
+            encoding='utf-8'
+        )
+
         eddnfiles[eventtype] = eddnfile
 
     eddnfile.write(json.dumps(msg, sort_keys=True))
@@ -113,6 +139,10 @@ def process_msg(eddndir, msg):
 
 
 def process_raw_msg(eddndir, message):
+    '''
+    Process a raw message from EDDN relay
+    '''
+
     try:
         message = zlib.decompress(message)
     except (zlib.error, TypeError):
@@ -144,29 +174,38 @@ def process_raw_msg(eddndir, message):
         logger.exception("Unhandled event: %s", json.dumps(msg))
 
 
-def update_message_types(file):
-    for line in file:
-        try:
-            schema, msgtype = line.strip().split()
-            if schema.startswith(SCHEMABASE) and eventtype_regex.match(msgtype):
-                message_types[schema] = msgtype
-        except ValueError:
-            pass
+def update_message_type(line):
+    '''
+    Update message type from message types file
+    '''
+
+    try:
+        schema, msgtype = line.strip().split()
+        if schema.startswith(SCHEMABASE) and eventtype_regex.match(msgtype):
+            message_types[schema] = msgtype
+    except ValueError:
+        pass
 
 
 def read_message_types(eddndir):
-    global message_types_last_read
-    message_types_last_read = time.monotonic()
+    '''
+    Update message types from message types file
+    '''
 
     try:
         with open(eddndir + '/msgtypes.txt', 'r', encoding='utf-8') as file:
-            update_message_types(file)
+            for line in file:
+                update_message_type(line)
     except (IOError, UnicodeError):
         pass
 
 
 def setup_logging(logprefix):
-    fileHandler = TimedRotatingFileHandler(
+    '''
+    Setup logging
+    '''
+
+    file_handler = TimedRotatingFileHandler(
         filename=logprefix + ".log",
         when="midnight",
         interval=1,
@@ -174,24 +213,72 @@ def setup_logging(logprefix):
         encoding="utf-8"
     )
 
-    fileHandler.suffix = "%Y-%m-%d"
+    file_handler.suffix = "%Y-%m-%d"
 
-    stderrHandler = StreamHandler(sys.stderr)
+    stderr_handler = StreamHandler(sys.stderr)
 
     formatter = logging.Formatter(
         "[%(asctime)s][%(levelname)s][%(name)s] %(message)s"
     )
 
-    fileHandler.setFormatter(formatter)
-    stderrHandler.setFormatter(formatter)
+    file_handler.setFormatter(formatter)
+    stderr_handler.setFormatter(formatter)
 
-    logger.addHandler(fileHandler)
-    logger.addHandler(stderrHandler)
+    logger.addHandler(file_handler)
+    logger.addHandler(stderr_handler)
 
     logger.setLevel(logging.INFO)
 
 
+def listen(subscriber, timeout, eddndir):
+    '''
+    Listen to ZMQ subscriber socket
+    '''
+
+    last_recv_msec = time.monotonic_ns() // 1000000
+    last_stat_msec = last_recv_msec
+    line_count = 0
+    message_types_last_read = 0
+
+    while True:
+        if time.monotonic() > message_types_last_read + 300:
+            message_types_last_read = time.monotonic()
+            read_message_types(eddndir)
+
+        now_msec = time.monotonic_ns() // 1000000
+
+        while now_msec - last_stat_msec > 5000:
+            if line_count > 0:
+                logger.info("Received %d events", line_count)
+                line_count = 0
+            last_stat_msec += 5000
+
+        if subscriber.poll(last_stat_msec + 5000 - now_msec):
+            last_recv_msec = now_msec
+            line_count += 1
+            message = subscriber.recv()
+
+            if not message:
+                logger.warning("subscriber.recv() returned nothing")
+                return
+
+            if hasattr(signal, 'SIGUSR1') and hasattr(signal, 'SIG_BLOCK'):
+                signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGUSR1,))
+
+            process_raw_msg(eddndir, message)
+
+            if hasattr(signal, 'SIGUSR1') and hasattr(signal, 'SIG_UNBLOCK'):
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGUSR1,))
+        elif now_msec - last_recv_msec > timeout:
+            logger.error('No messages received')
+            return
+
+
 def main():
+    '''
+    Main function
+    '''
+
     relay = os.environ.get('EDDN_RELAY') or RELAY
     eddndir = os.environ.get('EDDN_DIR') or EDDNDIR
     logprefix = os.environ.get('EDDN_LOGPREFIX') or LOGPREFIX
@@ -207,51 +294,23 @@ def main():
     subscriber = context.socket(zmq.SUB)
     subscriber.setsockopt(zmq.SUBSCRIBE, b'')
     subscriber.setsockopt(zmq.RCVTIMEO, timeout)
-    signal.signal(signal.SIGUSR1, handle_usr1)
+
+    if hasattr(signal, 'SIGUSR1'):
+        signal.signal(signal.SIGUSR1, handle_usr1)
 
     while True:
         try:
             subscriber.connect(relay)
-            last_recv_msec = time.monotonic_ns() // 1000000
-            last_stat_msec = last_recv_time
-            line_count = 0
 
-            while True:
-                if time.monotonic() > message_types_last_read + 300:
-                    read_message_types(eddndir)
-
-                now_msec = time.monotonic_ns() // 1000000
-
-                while now_msec - last_stat_msec > 5000:
-                    if line_count > 0:
-                        logger.info("Received %d events", line_count)
-                        line_count = 0
-                    last_stat_msec += 5000
-
-                if subscriber.poll(last_stat_msec + 5000 - now_msec):
-                    last_recv_msec = now_msec
-                    line_count += 1
-                    message = subscriber.recv()
-
-                    if not message:
-                        logger.warning("subscriber.recv() returned nothing")
-                        subscriber.disconnect(relay)
-                        break
-
-                    signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGUSR1,))
-
-                    process_raw_msg(eddndir, message)
-
-                    signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGUSR1,))
-                elif now_msec - last_recv_msec > timeout:
-                    logger.error('No messages received')
-                    break
+            listen(subscriber, timeout, eddndir)
 
         except zmq.ZMQError as e:
             logger.exception("ZMQ Error: %s", e)
-            subscriber.disconnect(relay)
 
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGUSR1,))
+        subscriber.disconnect(relay)
+
+        if hasattr(signal, 'SIGUSR1') and hasattr(signal, 'SIG_UNBLOCK'):
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGUSR1,))
 
         time.sleep(5)
 
