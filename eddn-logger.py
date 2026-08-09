@@ -12,7 +12,8 @@ import re
 import signal
 from urllib.parse import quote
 import logging
-from logging.handlers import TimedRotatingFileHandler, StreamHandler
+from logging import StreamHandler
+from logging.handlers import TimedRotatingFileHandler
 
 
 RELAY = 'tcp://eddn.edcd.io:9500'
