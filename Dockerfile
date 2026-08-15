@@ -9,7 +9,7 @@ RUN addgroup -g ${APPGID} app && \
 
 RUN mkdir -p /srv/EDDN/data /srv/EDDN/log
 
-RUN apk add --no-cache rsync ssh
+RUN apk add --no-cache rsync openssh-client
 
 WORKDIR /app
 
