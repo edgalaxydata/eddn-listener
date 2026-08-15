@@ -183,6 +183,10 @@ def write_eddnline(eddnfile: EDDNFile, line: bytes):
         eddnfile.file.write(b'\n')
         eddnfile.file.flush()
 
+        return True
+
+    return False
+
 
 def get_eventtype(msg: EDDNMessage) -> str:
     '''
@@ -418,8 +422,22 @@ def init_local_file(eddnfile: EDDNFile, eddnname: str):
 
             linehash = hashlib.sha256(line).digest()
             eddnfile.hashes.add(linehash)
+
+            if (linenum % 10000) == 0:
+                logger.info(
+                    'Loaded %d lines from file %s',
+                    linenum,
+                    eddnname
+                )
+
             pos = file.tell()
             linenum += 1
+
+        logger.info(
+            'Loaded %d lines from file %s',
+            linenum,
+            eddnname
+        )
 
 
 def init_local_files(eddndir: str, suffix: str):
@@ -431,6 +449,7 @@ def init_local_files(eddndir: str, suffix: str):
         if filename.endswith(suffix):
             eddnname = os.path.join(eddndir, filename)
             eventtype = filename[:-len(suffix)]
+            logger.info('Loading events from local file %s', eddnname)
 
             eddnfile = get_eddnfile(eventtype, eddnname)
 
@@ -442,8 +461,14 @@ def sync_mirror_file(eddnfile: EDDNFile, remote_name: str, file: BinaryIO):
     Sync EDDN events from another stream
     '''
 
+    logger.info(
+        'Loading events from file %s',
+        remote_name
+    )
+
     pos = 0
     linenum = 1
+    copied_lines = 0
 
     for line in file:
         line_len = len(line)
@@ -452,9 +477,26 @@ def sync_mirror_file(eddnfile: EDDNFile, remote_name: str, file: BinaryIO):
         if not is_valid_line(line, remote_name, pos, linenum):
             continue
 
-        write_eddnline(eddnfile, line)
+        if write_eddnline(eddnfile, line):
+            copied_lines += 1
+
+        if (linenum % 10000) == 0:
+            logger.info(
+                'Loaded %d lines from file %s (%d copied)',
+                linenum,
+                remote_name,
+                copied_lines
+            )
+
         pos += line_len
         linenum += 1
+
+    logger.info(
+        'Loaded %d lines from file %s (%d copied)',
+        linenum,
+        remote_name,
+        copied_lines
+    )
 
 
 def sync_mirror(mirror_host: str,
@@ -469,6 +511,7 @@ def sync_mirror(mirror_host: str,
     suffix = f'-{today}.jsonl'
 
     try:
+        logger.info('Connecting to SFTP host %s', mirror_host)
         ssh_client = paramiko.SSHClient()
         ssh_client.load_system_host_keys()
 
@@ -488,6 +531,8 @@ def sync_mirror(mirror_host: str,
         return
 
     init_local_files(eddndir, suffix)
+
+    logger.info('Enumerating files on SFTP host %s', mirror_host)
 
     for filename in sftp.listdir(mirror_dir):
         if filename.endswith(suffix):
@@ -580,6 +625,7 @@ def main():
 
     while True:
         try:
+            logger.info('Connecting to relay %s', relay)
             subscriber.connect(relay)
 
             if mirror_host and mirror_user:
