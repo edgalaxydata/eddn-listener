@@ -73,7 +73,7 @@ class JsonLogFormatter(logging.Formatter):
         ts = datetime.fromtimestamp(record.created, tz=timezone.utc)
 
         payload = {
-            'created': ts,
+            'created': ts.isoformat(),
             'levelname': record.levelname,
             'name': record.name,
             'message': record.message,
