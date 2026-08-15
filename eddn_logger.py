@@ -12,6 +12,7 @@ from datetime import datetime, timezone, UTC
 import os
 import os.path
 import re
+import io
 import math
 import signal
 import hashlib
@@ -407,37 +408,39 @@ def init_local_file(eddnfile: EDDNFile, eddnname: str):
     '''
 
     with open(eddnname, 'rb+') as file:
-        pos = file.tell()
-        linenum = 1
+        with io.BufferedReader(file, 1048576) as buf:
+            pos = 0
+            linenum = 1
 
-        while line := file.readline():
-            if not is_valid_line(line, eddnname, pos, linenum):
-                with open(eddnname + ".bad", 'wb') as ofile:
-                    shutil.copyfileobj(file, ofile)
+            while line := buf.readline():
+                if not is_valid_line(line, eddnname, pos, linenum):
+                    with open(eddnname + ".bad", 'wb') as ofile:
+                        shutil.copyfileobj(file, ofile)
 
-                file.truncate(pos)
-                break
+                    file.truncate(pos)
+                    break
 
-            line = line.strip()
+                pos += len(line)
 
-            linehash = hashlib.sha256(line).digest()
-            eddnfile.hashes.add(linehash)
+                line = line.strip()
 
-            if (linenum % 10000) == 0:
-                logger.info(
-                    'Loaded %d lines from file %s',
-                    linenum,
-                    eddnname
-                )
+                linehash = hashlib.sha256(line).digest()
+                eddnfile.hashes.add(linehash)
 
-            pos = file.tell()
-            linenum += 1
+                if (linenum % 1000) == 0:
+                    logger.info(
+                        'Loaded %d lines from file %s',
+                        linenum,
+                        eddnname
+                    )
 
-        logger.info(
-            'Loaded %d lines from file %s',
-            linenum,
-            eddnname
-        )
+                linenum += 1
+
+            logger.info(
+                'Loaded %d lines from file %s',
+                linenum,
+                eddnname
+            )
 
 
 def init_local_files(eddndir: str, suffix: str):
@@ -480,7 +483,7 @@ def sync_mirror_file(eddnfile: EDDNFile, remote_name: str, file: BinaryIO):
         if write_eddnline(eddnfile, line):
             copied_lines += 1
 
-        if (linenum % 10000) == 0:
+        if (linenum % 1000) == 0:
             logger.info(
                 'Loaded %d lines from file %s (%d copied)',
                 linenum,
@@ -543,7 +546,8 @@ def sync_mirror(mirror_host: str,
             eddnfile = get_eddnfile(eventtype, eddnname)
 
             with sftp.open(remote_name, 'rb') as file:
-                sync_mirror_file(eddnfile, f'remote:{remote_name}', file)
+                with io.BufferedReader(file, 1048576) as buf:
+                    sync_mirror_file(eddnfile, f'remote:{remote_name}', buf)
 
 
 def listen(subscriber: zmq.Socket, timeout: int, eddndir: str):
