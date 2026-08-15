@@ -19,6 +19,7 @@ import hashlib
 import shutil
 import tempfile
 import subprocess
+import traceback
 from urllib.parse import quote
 import logging
 from logging import StreamHandler
@@ -104,9 +105,27 @@ class JsonLogFormatter(logging.Formatter):
         }
 
         if hasattr(record, '__dict__'):
-            payload['data'] = dict(record.__dict__)
+            data = payload['data'] = {}
 
-        return json.dumps(payload)
+            for key, value in record.__dict__.items():
+                if key == 'exc_info':
+                    exc_type, exc_value, exc_traceback = value
+
+                    tb_lines = traceback.format_exception(
+                        exc_type,
+                        exc_value,
+                        exc_traceback
+                    )
+
+                    data['exc_info'] = {
+                        'type': exc_type.__name__ if exc_type else None,
+                        'message': str(exc_value),
+                        'traceback': tb_lines
+                    }
+                else:
+                    data[key] = value
+
+        return json.dumps(payload, default=str)
 
 
 eddnfiles: dict[EDDNFile] = {}
