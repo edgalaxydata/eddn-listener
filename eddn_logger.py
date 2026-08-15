@@ -67,6 +67,23 @@ class EDDNFile:
     hashes: set[bytes]
 
 
+# pylint: disable=too-many-instance-attributes
+@dataclass
+class ListenerOptions:
+    '''
+    Options for EDDN Listener
+    '''
+
+    relay: str
+    eddndir: str
+    logprefix: str
+    mirror_host: str | None
+    mirror_user: str | None
+    mirror_dir: str
+    mirror_rsync: bool
+    timeout: int
+
+
 class JsonLogFormatter(logging.Formatter):
     '''
     Formatter for JSON Lines log files
@@ -310,50 +327,6 @@ def read_message_types(eddndir):
         pass
 
 
-def setup_logging(logprefix):
-    '''
-    Setup logging
-    '''
-
-    file_handler = TimedRotatingFileHandler(
-        filename=logprefix + ".log",
-        when="midnight",
-        interval=1,
-        utc=True,
-        encoding="utf-8"
-    )
-
-    file_handler.suffix = "%Y-%m-%d"
-
-    json_handler = TimedRotatingFileHandler(
-        filename=logprefix + ".jsonl",
-        when="midnight",
-        interval=1,
-        utc=True,
-        encoding="utf-8"
-    )
-
-    json_handler.suffix = "%Y-%m-%d"
-
-    stderr_handler = StreamHandler(sys.stderr)
-
-    formatter = logging.Formatter(
-        "[%(asctime)s][%(levelname)s][%(name)s] %(message)s"
-    )
-
-    json_formatter = JsonLogFormatter()
-
-    file_handler.setFormatter(formatter)
-    json_handler.setFormatter(json_formatter)
-    stderr_handler.setFormatter(formatter)
-
-    logger.addHandler(file_handler)
-    logger.addHandler(json_handler)
-    logger.addHandler(stderr_handler)
-
-    logger.setLevel(logging.INFO)
-
-
 def is_valid_line(line: bytes,
                   eddnname: str,
                   pos: int,
@@ -509,6 +482,10 @@ def sync_mirror_rsync(mirror_host: str,
                       mirror_dir: str,
                       eddndir: str,
                       suffix: str):
+    '''
+    Sync from mirror using a tempdir
+    '''
+
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
             command = [
@@ -547,8 +524,12 @@ def sync_mirror_rsync(mirror_host: str,
 def sync_mirror_sftp(mirror_host: str,
                      mirror_user: str,
                      mirror_dir: str,
-                     suffix: str,
-                     eddndir: str):
+                     eddndir: str,
+                     suffix: str):
+    '''
+    Sync from mirror using SFTP
+    '''
+
     try:
         logger.info('Connecting to SFTP host %s', mirror_host)
         ssh_client = paramiko.SSHClient()
@@ -584,8 +565,8 @@ def sync_mirror_sftp(mirror_host: str,
                     sync_mirror_file(eddnfile, f'remote:{remote_name}', buf)
 
 
-def sync_mirror(mirror_host: str,
-                mirror_user: str,
+def sync_mirror(mirror_host: str | None,
+                mirror_user: str | None,
                 mirror_dir: str,
                 mirror_rsync: bool,
                 eddndir: str):
@@ -611,7 +592,8 @@ def sync_mirror(mirror_host: str,
             mirror_host,
             mirror_user,
             mirror_dir,
-            eddndir
+            eddndir,
+            suffix
         )
 
 
@@ -660,9 +642,65 @@ def listen(subscriber: zmq.Socket, timeout: int, eddndir: str):
             return
 
 
-def main():
+def setup_logging(logprefix):
     '''
-    Main function
+    Setup logging
+    '''
+
+    file_handler = TimedRotatingFileHandler(
+        filename=logprefix + ".log",
+        when="midnight",
+        interval=1,
+        utc=True,
+        encoding="utf-8"
+    )
+
+    file_handler.suffix = "%Y-%m-%d"
+
+    json_handler = TimedRotatingFileHandler(
+        filename=logprefix + ".jsonl",
+        when="midnight",
+        interval=1,
+        utc=True,
+        encoding="utf-8"
+    )
+
+    json_handler.suffix = "%Y-%m-%d"
+
+    stderr_handler = StreamHandler(sys.stderr)
+
+    formatter = logging.Formatter(
+        "[%(asctime)s][%(levelname)s][%(name)s] %(message)s"
+    )
+
+    json_formatter = JsonLogFormatter()
+
+    file_handler.setFormatter(formatter)
+    json_handler.setFormatter(json_formatter)
+    stderr_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(json_handler)
+    logger.addHandler(stderr_handler)
+
+    logger.setLevel(logging.INFO)
+
+
+def setup_signals():
+    '''
+    Setup available signals
+    '''
+
+    if hasattr(signal, 'SIGUSR1'):
+        signals.append(signal.SIGUSR1)
+        signal.signal(signal.SIGUSR1, handle_usr1)
+    if hasattr(signal, 'SIGINT'):
+        signals.append(signal.SIGINT)
+
+
+def get_options() -> ListenerOptions:
+    '''
+    Process options from environment
     '''
 
     relay = os.environ.get('EDDN_RELAY') or RELAY
@@ -679,44 +717,69 @@ def main():
     except (ValueError, TypeError):
         timeout = TIMEOUT
 
-    setup_logging(logprefix)
+    return ListenerOptions(
+        relay=relay,
+        eddndir=eddndir,
+        logprefix=logprefix,
+        mirror_host=mirror_host,
+        mirror_user=mirror_user,
+        mirror_dir=mirror_dir,
+        mirror_rsync=mirror_rsync,
+        timeout=timeout
+    )
 
-    if hasattr(signal, 'SIGUSR1'):
-        signals.append(signal.SIGUSR1)
-    if hasattr(signal, 'SIGINT'):
-        signals.append(signal.SIGINT)
+
+def main_loop(subscriber: zmq.Socket, opts: ListenerOptions):
+    '''
+    Main listener loop body
+    '''
+
+    try:
+        logger.info('Connecting to relay %s', opts.relay)
+        subscriber.connect(opts.relay)
+
+        sync_mirror(
+            opts.mirror_host,
+            opts.mirror_user,
+            opts.mirror_dir,
+            opts.mirror_rsync,
+            opts.eddndir
+        )
+
+        listen(subscriber, opts.timeout, opts.eddndir)
+
+    except zmq.ZMQError as e:
+        logger.exception("ZMQ Error: %s", e)
+    except KeyboardInterrupt:
+        logger.warning("Exiting")
+        return
+
+    subscriber.disconnect(opts.relay)
+
+    if hasattr(signal, 'SIG_UNBLOCK') and signals:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, signals)
+
+    time.sleep(5)
+
+
+def main():
+    '''
+    Main function
+    '''
+
+    opts = get_options()
+
+    setup_logging(opts.logprefix)
+    setup_signals()
 
     context = zmq.Context.instance()
     subscriber = context.socket(zmq.SUB)
     subscriber.setsockopt(zmq.SUBSCRIBE, b'')
-    subscriber.setsockopt(zmq.RCVTIMEO, timeout)
+    subscriber.setsockopt(zmq.RCVTIMEO, opts.timeout)
     subscriber.set(zmq.RCVHWM, 10000)
 
-    if hasattr(signal, 'SIGUSR1'):
-        signal.signal(signal.SIGUSR1, handle_usr1)
-
     while True:
-        try:
-            logger.info('Connecting to relay %s', relay)
-            subscriber.connect(relay)
-
-            if mirror_host and mirror_user:
-                sync_mirror(mirror_host, mirror_user, mirror_dir, eddndir)
-
-            listen(subscriber, timeout, eddndir)
-
-        except zmq.ZMQError as e:
-            logger.exception("ZMQ Error: %s", e)
-        except KeyboardInterrupt:
-            logger.warning("Exiting")
-            return
-
-        subscriber.disconnect(relay)
-
-        if hasattr(signal, 'SIG_UNBLOCK') and signals:
-            signal.pthread_sigmask(signal.SIG_UNBLOCK, signals)
-
-        time.sleep(5)
+        main_loop(subscriber, opts)
 
 
 if __name__ == '__main__':
