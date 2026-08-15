@@ -8,7 +8,7 @@ import zlib
 import json
 import sys
 import time
-from datetime import datetime, timezone, UTC
+from datetime import datetime, timezone, UTC, timedelta
 import os
 import os.path
 import re
@@ -20,14 +20,17 @@ import shutil
 import tempfile
 import subprocess
 import traceback
-from urllib.parse import quote
+import glob
+from urllib.parse import quote, urlsplit, urljoin
 import logging
 from logging import StreamHandler
 from logging.handlers import TimedRotatingFileHandler
 from typing import TypedDict, Required, BinaryIO
 from dataclasses import dataclass
+import requests
 import zmq
 import paramiko
+from bs4 import BeautifulSoup
 
 
 RELAY = 'tcp://eddn.edcd.io:9500'
@@ -81,6 +84,7 @@ class ListenerOptions:
     mirror_host: str | None
     mirror_user: str | None
     mirror_dir: str
+    mirror_url: str
     mirror_rsync: bool
     timeout: int
 
@@ -618,36 +622,172 @@ def sync_mirror_sftp(mirror_host: str,
                     sync_mirror_file(eddnfile, f'remote:{remote_name}', buf)
 
 
-def sync_mirror(mirror_host: str | None,
-                mirror_user: str | None,
-                mirror_dir: str,
-                mirror_rsync: bool,
-                eddndir: str):
+def https_listdir(mirror_url: str,
+                  session: requests.Session,
+                  suffix: str):
+    '''
+    Retrieve files from HTTPS directory listing
+    '''
+
+    try:
+        response = session.get(mirror_url, timeout=5)
+        response.raise_for_status()
+        html = response.text
+        mirror_url = response.url
+    except OSError:
+        logger.exception("Error listing HTTPS url")
+        return {}
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    base = urlsplit(mirror_url)
+    base_path = base.path
+
+    if not base_path.endswith('/'):
+        base_path += '/'
+
+    files = {}
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+
+        if not href:
+            continue
+
+        link_url = urljoin(mirror_url, href)
+        link = urlsplit(link_url)
+
+        if link.scheme != base.scheme or \
+            link.netloc != base.netloc or \
+            not link.path.startswith(base_path) or \
+            not link.path.endswith(suffix):
+            continue
+
+        relpath = link.path[len(base_path):]
+        msgtype = relpath[:len(suffix)]
+
+        if '/' in relpath or \
+           '\\' in relpath or \
+           not eventtype_regex.match(msgtype):
+            continue
+
+        files[relpath] = link_url
+
+    return files
+
+
+def sync_mirror_https_file(url: str,
+                           filename: str,
+                           eddndir: str,
+                           suffix: str):
+    '''
+    Sync file from mirror using HTTPS
+    '''
+
+    eddnname = os.path.join(eddndir, filename)
+    eventtype = filename[:-len(suffix)]
+
+    eddnfile = get_eddnfile(eventtype, eddnname)
+
+    with requests.get(url, stream=True, timeout=5) as response:
+        with io.BufferedReader(response.raw, 1048576) as buf:
+            sync_mirror_file(eddnfile, url, buf)
+
+
+def sync_mirror_https(mirror_url: str,
+                      eddndir: str,
+                      suffix: str) -> dict[str, str]:
+    '''
+    Sync from mirror using HTTPS
+    '''
+
+    with requests.Session() as session:
+        files = https_listdir(mirror_url, session, suffix)
+
+        for name, url in files.items():
+            sync_mirror_https_file(url, name, eddndir, suffix)
+
+
+def sync_mirror_url(mirror_url: str,
+                    eddndir: str,
+                    suffix: str):
+    '''
+    Sync from mirror using a URL
+    '''
+
+    parsed = urlsplit(mirror_url)
+
+    match parsed.scheme:
+        case 'rsync+ssh':
+            sync_mirror_rsync(
+                parsed.hostname,
+                parsed.username,
+                parsed.path,
+                eddndir,
+                suffix
+            )
+        case 'sftp':
+            sync_mirror_sftp(
+                parsed.hostname,
+                parsed.username,
+                parsed.path,
+                eddndir,
+                suffix
+            )
+        case 'https':
+            sync_mirror_https(
+                mirror_url,
+                eddndir,
+                suffix
+            )
+
+
+def sync_mirror(opts: ListenerOptions):
     '''
     Sync EDDN events from another host
     '''
 
-    today = datetime.now(UTC).strftime('%Y-%m-%d')
-    suffix = f'-{today}.jsonl'
+    today = datetime.now(UTC)
+    yesterday = today - timedelta(days=1)
+    today = today.strftime('%Y-%m-%d')
+    yesterday = yesterday.strftime('%Y-%m-%d')
 
-    init_local_files(eddndir, suffix)
+    suffixes = [
+        f'-{today}.jsonl'
+    ]
 
-    if mirror_rsync:
-        sync_mirror_rsync(
-            mirror_host,
-            mirror_user,
-            mirror_dir,
-            eddndir,
-            suffix
-        )
-    else:
-        sync_mirror_sftp(
-            mirror_host,
-            mirror_user,
-            mirror_dir,
-            eddndir,
-            suffix
-        )
+    if not glob.glob(f"*-{today}.json", root_dir=opts.eddndir):
+        suffixes = [
+            f'-{yesterday}.jsonl',
+            f'-{today}.jsonl'
+        ]
+
+    for suffix in suffixes:
+        if init_local_files(opts.eddndir, suffix):
+            if opts.mirror_url is not None:
+                sync_mirror_url(
+                    opts.mirror_url,
+                    opts.eddndir,
+                    suffix
+                )
+            elif opts.mirror_host is not None and \
+                 opts.mirror_user is not None:
+                if opts.mirror_rsync:
+                    sync_mirror_rsync(
+                        opts.mirror_host,
+                        opts.mirror_user,
+                        opts.mirror_dir,
+                        opts.eddndir,
+                        suffix
+                    )
+                else:
+                    sync_mirror_sftp(
+                        opts.mirror_host,
+                        opts.mirror_user,
+                        opts.mirror_dir,
+                        opts.eddndir,
+                        suffix
+                    )
 
 
 def listen(subscriber: zmq.Socket, timeout: int, eddndir: str):
@@ -761,6 +901,7 @@ def get_options() -> ListenerOptions:
     logprefix = os.environ.get('EDDN_LOGPREFIX') or LOGPREFIX
     mirror_host = os.environ.get('EDDN_MIRROR_HOST')
     mirror_user = os.environ.get('EDDN_MIRROR_USER')
+    mirror_url = os.environ.get('EDDN_MIRROR_URL')
     mirror_dir = os.environ.get('EDDN_MIRROR_DIR') or eddndir
     mirror_rsync = os.environ.get('EDDN_MIRROR_RSYNC', 'False')
     mirror_rsync = mirror_rsync.lower() in ('true', 'yes', '1')
@@ -777,6 +918,7 @@ def get_options() -> ListenerOptions:
         mirror_host=mirror_host,
         mirror_user=mirror_user,
         mirror_dir=mirror_dir,
+        mirror_url=mirror_url,
         mirror_rsync=mirror_rsync,
         timeout=timeout
     )
@@ -791,13 +933,7 @@ def main_loop(subscriber: zmq.Socket, opts: ListenerOptions):
         logger.info('Connecting to relay %s', opts.relay)
         subscriber.connect(opts.relay)
 
-        sync_mirror(
-            opts.mirror_host,
-            opts.mirror_user,
-            opts.mirror_dir,
-            opts.mirror_rsync,
-            opts.eddndir
-        )
+        sync_mirror(opts)
 
         listen(subscriber, opts.timeout, opts.eddndir)
 
