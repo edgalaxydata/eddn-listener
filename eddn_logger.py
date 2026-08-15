@@ -90,6 +90,32 @@ class JsonLogFormatter(logging.Formatter):
     Formatter for JSON Lines log files
     '''
 
+    exclude_record_attrs = [
+        "name",
+        "msg",
+        "args",
+        "levelname",
+        "levelno",
+        #"pathname",
+        "filename",
+        "module",
+        #"exc_info",
+        "exc_text",
+        #"stack_info",
+        "lineno",
+        "funcName",
+        "created",
+        "msecs",
+        "relativeCreated",
+        "thread",
+        "threadName",
+        "processName",
+        "process",
+        "taskName",
+        "message",
+        "asctime"
+    ]
+
     def format(self, record: logging.LogRecord) -> str:
         ts = datetime.fromtimestamp(record.created, tz=timezone.utc)
 
@@ -97,18 +123,21 @@ class JsonLogFormatter(logging.Formatter):
             'created': ts.isoformat(),
             'levelname': record.levelname,
             'name': record.name,
-            'message': record.message,
+            'msg': record.msg,
             'args': record.args,
-            'formatted_message': record.getMessage(),
+            'message': record.message,
             'module': record.module,
-            'lineno': record.lineno
+            'lineno': record.lineno,
+            'funcName': record.funcName
         }
 
         if hasattr(record, '__dict__'):
             data = payload['data'] = {}
 
             for key, value in record.__dict__.items():
-                if key == 'exc_info':
+                if key in self.exclude_record_attrs or value is None:
+                    pass
+                elif key == 'exc_info':
                     exc_type, exc_value, exc_traceback = value
 
                     tb_lines = traceback.format_exception(
