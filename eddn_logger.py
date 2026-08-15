@@ -544,6 +544,11 @@ def sync_mirror_rsync(mirror_host: str,
                 f'--copy-dest={eddndir}'
             ]
 
+            logger.info(
+                'Syncing files from mirror %s',
+                mirror_host
+            )
+
             subprocess.run(
                 command,
                 check=True,
