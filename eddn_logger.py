@@ -798,14 +798,11 @@ def main_loop(subscriber: zmq.Socket, opts: ListenerOptions):
 
     except zmq.ZMQError as e:
         logger.exception("ZMQ Error: %s", e)
-    except KeyboardInterrupt:
-        logger.warning("Exiting")
-        return
+    finally:
+        subscriber.disconnect(opts.relay)
 
-    subscriber.disconnect(opts.relay)
-
-    if hasattr(signal, 'SIG_UNBLOCK') and signals:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, signals)
+        if hasattr(signal, 'SIG_UNBLOCK') and signals:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, signals)
 
     time.sleep(5)
 
@@ -826,8 +823,11 @@ def main():
     subscriber.setsockopt(zmq.RCVTIMEO, opts.timeout)
     subscriber.set(zmq.RCVHWM, 10000)
 
-    while True:
-        main_loop(subscriber, opts)
+    try:
+        while True:
+            main_loop(subscriber, opts)
+    except KeyboardInterrupt:
+        logger.warning("Exiting")
 
 
 if __name__ == '__main__':
