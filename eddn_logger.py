@@ -8,17 +8,22 @@ import zlib
 import json
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import os.path
 import re
 import math
 import signal
+import hashlib
+import shutil
 from urllib.parse import quote
 import logging
 from logging import StreamHandler
 from logging.handlers import TimedRotatingFileHandler
+from typing import TypedDict, Required, BinaryIO
+from dataclasses import dataclass
 import zmq
+import paramiko
 
 
 RELAY = 'tcp://eddn.edcd.io:9500'
@@ -27,11 +32,64 @@ SCHEMABASE = 'https://eddn.edcd.io/schemas/'
 EDDNDIR = '/srv/EDDN/data'
 LOGPREFIX = '/srv/EDDN/log/eddn-live'
 
+
 logger = logging.getLogger(__name__)
 
 
-eddnfiles = {}
-eddnfilenames = {}
+EDDNHeader = TypedDict('EDDNHeader', {
+    'gatewayTimestamp': Required[str],
+    'softwareName': Required[str],
+    'softwareVersion': Required[str],
+    'gameversion': str,
+    'gamebuild': str,
+    'uploaderID': str
+}, total=False)
+
+
+EDDNMessage = TypedDict('EDDNMessage', {
+    '$schemaRef': Required[str],
+    'header': Required[EDDNHeader],
+    'message': dict
+}, total=False)
+
+
+@dataclass
+class EDDNFile:
+    '''
+    Data class holding EDDN file state
+    '''
+
+    filename: str
+    file: BinaryIO
+    hashes: set[bytes]
+
+
+class JsonLogFormatter(logging.Formatter):
+    '''
+    Formatter for JSON Lines log files
+    '''
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts = datetime.fromtimestamp(record.created, tz=timezone.utc)
+
+        payload = {
+            'created': ts,
+            'levelname': record.levelname,
+            'name': record.name,
+            'message': record.message,
+            'args': record.args,
+            'formatted_message': record.getMessage(),
+            'module': record.module,
+            'lineno': record.lineno
+        }
+
+        if hasattr(record, '__dict__'):
+            payload['data'] = dict(record.__dict__)
+
+        return json.dumps(payload)
+
+
+eddnfiles: dict[EDDNFile] = {}
 
 message_types = {
     'https://eddn.edcd.io/schemas/journal/1': 'Journal',
@@ -68,7 +126,7 @@ eventtype_regex = re.compile(
     '^[A-Z][A-Za-z0-9._-]*[A-Za-z0-9]$'
 )
 
-signals = []
+signals: list[signal.Signals] = []
 
 
 def restart():
@@ -88,20 +146,51 @@ def handle_usr1():
     restart()
 
 
-def process_msg(eddndir, msg):
+def get_eddnfile(eventtype: str, eddnname: str) -> EDDNFile:
     '''
-    Process a single EDDN message
+    Open or create EDDN dump file
+    '''
+
+    eddnfile = eddnfiles.get(eventtype)
+
+    if eddnfile is not None and eddnfile.filename != eddnname:
+        eddnfile.file.close()
+        eddnfile = None
+
+    if eddnfile is None:
+        file = open(  # pylint: disable=consider-using-with
+            eddnname,
+            'ab'
+        )
+
+        eddnfile = EDDNFile(eddnname, file, set())
+        eddnfiles[eventtype] = eddnfile
+
+    return eddnfile
+
+
+def write_eddnline(eddnfile: EDDNFile, line: bytes):
+    '''
+    Write line to file if it hasn't already been seen
+    '''
+
+    linehash = hashlib.sha256(line).digest()
+
+    if linehash not in eddnfile.hashes:
+        eddnfile.hashes.add(linehash)
+
+        eddnfile.file.write(line)
+        eddnfile.file.write(b'\n')
+        eddnfile.file.flush()
+
+
+def get_eventtype(msg: EDDNMessage) -> str:
+    '''
+    Generate filename prefix from message schema / event type
     '''
 
     schema_ref = msg.get('$schemaRef', '-')
     msgtype = message_types.get(schema_ref, 'Unknown')
-
-    gwts = msg.get('header', {}).get('gatewayTimestamp')
-
-    if gwts is None or not gwts_regex.match(gwts):
-        logger.warning('Unrecognised gateway timestamp %s', gwts)
-        gwts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
-
     evttype = msg.get('message', {}).get('event')
 
     if evttype is not None and not msgevent_regex.match(evttype):
@@ -112,42 +201,44 @@ def process_msg(eddndir, msg):
             'Unrecognised schema %s',
             schema_ref
         )
-        eventtype = 'Unknown'
-    elif msgtype not in ['Journal', 'Test-Journal']:
-        eventtype = quote(msgtype)
-    elif evttype is not None:
-        eventtype = quote(msgtype + '.' + evttype)
-    else:
-        logger.warning(
-            'Unrecognised schema / event %s / %s',
-            schema_ref,
-            evttype
-        )
-        eventtype = 'Unknown'
+        return 'Unknown'
 
-    eddnname = f'{eddndir}/{eventtype}-{gwts[0:10]}.jsonl'
+    if msgtype not in ['Journal', 'Test-Journal']:
+        return quote(msgtype)
 
-    eddnfile = eddnfiles.get(eventtype)
-    prevname = eddnfilenames.get(eventtype, '')
+    if evttype is not None:
+        return quote(msgtype + '.' + evttype)
 
-    if eddnfile is not None and prevname != eddnname:
-        eddnfile.close()
-        eddnfile = None
+    logger.warning(
+        'Unrecognised schema / event %s / %s',
+        schema_ref,
+        evttype
+    )
 
-    if eddnfile is None:
-        eddnfilenames[eventtype] = eddnname
+    return 'Unknown'
 
-        eddnfile = open(  # pylint: disable=consider-using-with
-            eddnfilenames[eventtype],
-            'a',
-            encoding='utf-8'
-        )
 
-        eddnfiles[eventtype] = eddnfile
+def process_msg(eddndir: str, msg: EDDNMessage):
+    '''
+    Process a single EDDN message
+    '''
 
-    eddnfile.write(json.dumps(msg, sort_keys=True))
-    eddnfile.write('\n')
-    eddnfile.flush()
+    eventtype = get_eventtype(msg)
+
+    gwts = msg.get('header', {}).get('gatewayTimestamp')
+
+    if gwts is None or not gwts_regex.match(gwts):
+        logger.warning('Unrecognised gateway timestamp %s', gwts)
+        gwts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
+
+    eddnname = f'{eventtype}-{gwts[0:10]}.jsonl'
+    eddnname = os.path.join(eddndir, eddnname)
+
+    eddnfile = get_eddnfile(eventtype, eddnname)
+
+    line = json.dumps(msg, sort_keys=True).encode('utf-8')
+
+    write_eddnline(eddnfile, line)
 
 
 def process_raw_msg(eddndir, message):
@@ -156,7 +247,7 @@ def process_raw_msg(eddndir, message):
     '''
 
     try:
-        message = zlib.decompress(message)
+        message = zlib.decompress(message).strip(b' \t\n\r\x0b\f\0')
     except (zlib.error, TypeError):
         logger.exception(
             "Unable to decompress event",
@@ -166,8 +257,8 @@ def process_raw_msg(eddndir, message):
         return
 
     try:
-        msg = message.decode('utf-8').strip()
-    except UnicodeError:
+        msg = message.decode('utf-8')
+    except UnicodeDecodeError:
         logger.exception(
             "Unparseable event",
             extra={'data': message.decode('latin1')}
@@ -227,22 +318,190 @@ def setup_logging(logprefix):
 
     file_handler.suffix = "%Y-%m-%d"
 
+    json_handler = TimedRotatingFileHandler(
+        filename=logprefix + ".jsonl",
+        when="midnight",
+        interval=1,
+        utc=True,
+        encoding="utf-8"
+    )
+
+    json_handler.suffix = "%Y-%m-%d"
+
     stderr_handler = StreamHandler(sys.stderr)
 
     formatter = logging.Formatter(
         "[%(asctime)s][%(levelname)s][%(name)s] %(message)s"
     )
 
+    json_formatter = JsonLogFormatter()
+
     file_handler.setFormatter(formatter)
+    json_handler.setFormatter(json_formatter)
     stderr_handler.setFormatter(formatter)
 
     logger.addHandler(file_handler)
+    logger.addHandler(json_handler)
     logger.addHandler(stderr_handler)
 
     logger.setLevel(logging.INFO)
 
 
-def listen(subscriber, timeout, eddndir):
+def is_valid_line(line: bytes,
+                  eddnname: str,
+                  pos: int,
+                  linenum: int) -> bool:
+    '''
+    Validate EDDN dump line
+    '''
+
+    if b'\0' in line:
+        logger.error(
+            "NUL bytes in file %s at %d (line %d col %d)",
+            eddnname,
+            pos + line.index(b'\0'),
+            linenum,
+            line.index(b'\0')
+        )
+
+        return False
+
+    try:
+        msg = line.decode('utf-8')
+    except UnicodeDecodeError as e:
+        logger.exception(
+            "Unparseable event in file %s at %d (line %d col %d)",
+            eddnname,
+            pos + e.start,
+            linenum,
+            e.start,
+            extra={'data': line}
+        )
+
+        return False
+
+    try:
+        _ = json.loads(msg)
+    except json.JSONDecodeError as e:
+        logger.exception(
+            "Unparseable event in file %s at %d (line %d col %d)",
+            eddnname,
+            pos + e.pos,
+            linenum,
+            e.pos,
+            extra={'data': line}
+        )
+
+        return False
+
+    return True
+
+
+def init_local_file(eddnfile: EDDNFile, eddnname: str):
+    '''
+    Initialise state from existing EDDN dump file
+    '''
+
+    with open(eddnname, 'rb+') as file:
+        pos = file.tell()
+        linenum = 1
+
+        while line := file.readline():
+            if not is_valid_line(line, eddnname, pos, linenum):
+                with open(eddnname + ".bad", 'wb') as ofile:
+                    shutil.copyfileobj(file, ofile)
+
+                file.truncate(pos)
+                break
+
+            line = line.strip()
+
+            linehash = hashlib.sha256(line).digest()
+            eddnfile.hashes.add(linehash)
+            pos = file.tell()
+            linenum += 1
+
+
+def init_local_files(eddndir: str, suffix: str):
+    '''
+    Initialise state from existing EDDN dump files
+    '''
+
+    for filename in os.listdir(eddndir):
+        if filename.endswith(suffix):
+            eddnname = os.path.join(eddndir, filename)
+            eventtype = filename[:-len(suffix)]
+
+            eddnfile = get_eddnfile(eventtype, eddnname)
+
+            init_local_file(eddnfile, eddnname)
+
+
+def sync_mirror_file(eddnfile: EDDNFile, remote_name: str, file: BinaryIO):
+    '''
+    Sync EDDN events from another stream
+    '''
+
+    pos = 0
+    linenum = 1
+
+    for line in file:
+        line_len = len(line)
+        line = line.strip(b' \t\n\r\x0b\f\0')
+
+        if not is_valid_line(line, remote_name, pos, linenum):
+            continue
+
+        write_eddnline(eddnfile, line)
+        pos += line_len
+        linenum += 1
+
+
+def sync_mirror(mirror_host: str,
+                mirror_user: str,
+                mirror_dir: str,
+                eddndir: str):
+    '''
+    Sync EDDN events from another host
+    '''
+
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    suffix = f'-{today}.jsonl'
+
+    try:
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+        ssh_client.connect(
+            mirror_host,
+            username=mirror_user,
+            timeout=5,
+            allow_agent=False,
+            banner_timeout=5,
+            auth_timeout=5,
+            channel_timeout=5
+        )
+
+        sftp = ssh_client.open_sftp()
+    except (OSError, paramiko.SSHException):
+        logger.exception("Error connecting to mirror host")
+        return
+
+    init_local_files(eddndir, suffix)
+
+    for filename in sftp.listdir(mirror_dir):
+        if filename.endswith(suffix):
+            remote_name = os.path.join(mirror_dir, filename)
+            eddnname = os.path.join(eddndir, filename)
+            eventtype = filename[:-len(suffix)]
+
+            eddnfile = get_eddnfile(eventtype, eddnname)
+
+            with sftp.open(remote_name, 'r') as file:
+                sync_mirror_file(eddnfile, f'remote:{remote_name}', file)
+
+
+def listen(subscriber: zmq.Socket, timeout: int, eddndir: str):
     '''
     Listen to ZMQ subscriber socket
     '''
@@ -295,6 +554,9 @@ def main():
     relay = os.environ.get('EDDN_RELAY') or RELAY
     eddndir = os.environ.get('EDDN_DIR') or EDDNDIR
     logprefix = os.environ.get('EDDN_LOGPREFIX') or LOGPREFIX
+    mirror_host = os.environ.get('EDDN_MIRROR_HOST')
+    mirror_user = os.environ.get('EDDN_MIRROR_USER')
+    mirror_dir = os.environ.get('EDDN_MIRROR_DIR') or eddndir
 
     try:
         timeout = int(os.environ.get('EDDN_TIMEOUT')) or TIMEOUT
@@ -319,6 +581,9 @@ def main():
     while True:
         try:
             subscriber.connect(relay)
+
+            if mirror_host and mirror_user:
+                sync_mirror(mirror_host, mirror_user, mirror_dir, eddndir)
 
             listen(subscriber, timeout, eddndir)
 
