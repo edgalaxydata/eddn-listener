@@ -470,7 +470,7 @@ def sync_mirror(mirror_host: str,
 
     try:
         ssh_client = paramiko.SSHClient()
-        ssh_client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        ssh_client.load_system_host_keys()
 
         ssh_client.connect(
             mirror_host,
