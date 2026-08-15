@@ -17,6 +17,8 @@ import math
 import signal
 import hashlib
 import shutil
+import tempfile
+import subprocess
 from urllib.parse import quote
 import logging
 from logging import StreamHandler
@@ -502,17 +504,51 @@ def sync_mirror_file(eddnfile: EDDNFile, remote_name: str, file: BinaryIO):
     )
 
 
-def sync_mirror(mirror_host: str,
-                mirror_user: str,
-                mirror_dir: str,
-                eddndir: str):
-    '''
-    Sync EDDN events from another host
-    '''
+def sync_mirror_rsync(mirror_host: str,
+                      mirror_user: str,
+                      mirror_dir: str,
+                      eddndir: str,
+                      suffix: str):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            command = [
+                '/usr/bin/rsync',
+                '-vz',
+                f'{mirror_user}@{mirror_host}:{mirror_dir}/*{suffix}',
+                tmpdir,
+                f'--copy-dest={eddndir}'
+            ]
 
-    today = datetime.now(UTC).strftime('%Y-%m-%d')
-    suffix = f'-{today}.jsonl'
+            subprocess.run(
+                command,
+                check=True,
+                stdin=subprocess.DEVNULL
+            )
+        except subprocess.SubprocessError:
+            logger.exception(
+                'Failed to sync from mirror %s',
+                mirror_host
+            )
+            return
 
+        for filename in os.listdir(tmpdir):
+            tmpname = os.path.join(tmpdir, filename)
+            remote_name = os.path.join(mirror_dir, filename)
+            eddnname = os.path.join(eddndir, filename)
+            eventtype = filename[:-len(suffix)]
+
+            eddnfile = get_eddnfile(eventtype, eddnname)
+
+            with open(tmpname, 'rb') as file:
+                with io.BufferedReader(file, 1048576) as buf:
+                    sync_mirror_file(eddnfile, f'remote:{remote_name}', buf)
+
+
+def sync_mirror_sftp(mirror_host: str,
+                     mirror_user: str,
+                     mirror_dir: str,
+                     suffix: str,
+                     eddndir: str):
     try:
         logger.info('Connecting to SFTP host %s', mirror_host)
         ssh_client = paramiko.SSHClient()
@@ -533,8 +569,6 @@ def sync_mirror(mirror_host: str,
         logger.exception("Error connecting to mirror host")
         return
 
-    init_local_files(eddndir, suffix)
-
     logger.info('Enumerating files on SFTP host %s', mirror_host)
 
     for filename in sftp.listdir(mirror_dir):
@@ -548,6 +582,37 @@ def sync_mirror(mirror_host: str,
             with sftp.open(remote_name, 'rb') as file:
                 with io.BufferedReader(file, 1048576) as buf:
                     sync_mirror_file(eddnfile, f'remote:{remote_name}', buf)
+
+
+def sync_mirror(mirror_host: str,
+                mirror_user: str,
+                mirror_dir: str,
+                mirror_rsync: bool,
+                eddndir: str):
+    '''
+    Sync EDDN events from another host
+    '''
+
+    today = datetime.now(UTC).strftime('%Y-%m-%d')
+    suffix = f'-{today}.jsonl'
+
+    init_local_files(eddndir, suffix)
+
+    if mirror_rsync:
+        sync_mirror_rsync(
+            mirror_host,
+            mirror_user,
+            mirror_dir,
+            eddndir,
+            suffix
+        )
+    else:
+        sync_mirror_sftp(
+            mirror_host,
+            mirror_user,
+            mirror_dir,
+            eddndir
+        )
 
 
 def listen(subscriber: zmq.Socket, timeout: int, eddndir: str):
@@ -606,6 +671,8 @@ def main():
     mirror_host = os.environ.get('EDDN_MIRROR_HOST')
     mirror_user = os.environ.get('EDDN_MIRROR_USER')
     mirror_dir = os.environ.get('EDDN_MIRROR_DIR') or eddndir
+    mirror_rsync = os.environ.get('EDDN_MIRROR_RSYNC', 'False')
+    mirror_rsync = mirror_rsync.lower() in ('true', 'yes', '1')
 
     try:
         timeout = int(os.environ.get('EDDN_TIMEOUT')) or TIMEOUT
@@ -623,6 +690,7 @@ def main():
     subscriber = context.socket(zmq.SUB)
     subscriber.setsockopt(zmq.SUBSCRIBE, b'')
     subscriber.setsockopt(zmq.RCVTIMEO, timeout)
+    subscriber.set(zmq.RCVHWM, 10000)
 
     if hasattr(signal, 'SIGUSR1'):
         signal.signal(signal.SIGUSR1, handle_usr1)
