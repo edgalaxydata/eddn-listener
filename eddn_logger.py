@@ -8,7 +8,7 @@ import zlib
 import json
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 import os
 import os.path
 import re
@@ -229,7 +229,7 @@ def process_msg(eddndir: str, msg: EDDNMessage):
 
     if gwts is None or not gwts_regex.match(gwts):
         logger.warning('Unrecognised gateway timestamp %s', gwts)
-        gwts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
+        gwts = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S')
 
     eddnname = f'{eventtype}-{gwts[0:10]}.jsonl'
     eddnname = os.path.join(eddndir, eddnname)
@@ -465,7 +465,7 @@ def sync_mirror(mirror_host: str,
     Sync EDDN events from another host
     '''
 
-    today = datetime.utcnow().strftime('%Y-%m-%d')
+    today = datetime.now(UTC).strftime('%Y-%m-%d')
     suffix = f'-{today}.jsonl'
 
     try:
@@ -497,7 +497,7 @@ def sync_mirror(mirror_host: str,
 
             eddnfile = get_eddnfile(eventtype, eddnname)
 
-            with sftp.open(remote_name, 'r') as file:
+            with sftp.open(remote_name, 'rb') as file:
                 sync_mirror_file(eddnfile, f'remote:{remote_name}', file)
 
 
