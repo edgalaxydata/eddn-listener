@@ -756,7 +756,7 @@ def sync_mirror(opts: ListenerOptions):
         f'-{today}.jsonl'
     ]
 
-    if not glob.glob(f"*-{today}.json", root_dir=opts.eddndir):
+    if not glob.glob(f"*-{today}.jsonl", root_dir=opts.eddndir):
         suffixes = [
             f'-{yesterday}.jsonl',
             f'-{today}.jsonl'
