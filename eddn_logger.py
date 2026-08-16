@@ -475,7 +475,9 @@ def init_local_files(eddndir: str, suffix: str):
     Initialise state from existing EDDN dump files
     '''
 
-    for filename in os.listdir(eddndir):
+    files = list(os.listdir(eddndir))
+
+    for filename in files:
         if filename.endswith(suffix):
             eddnname = os.path.join(eddndir, filename)
             eventtype = filename[:-len(suffix)]
@@ -484,6 +486,8 @@ def init_local_files(eddndir: str, suffix: str):
             eddnfile = get_eddnfile(eventtype, eddnname)
 
             init_local_file(eddnfile, eddnname)
+
+    return len(files) > 0
 
 
 def sync_mirror_file(eddnfile: EDDNFile, remote_name: str, file: BinaryIO):
@@ -753,17 +757,17 @@ def sync_mirror(opts: ListenerOptions):
     yesterday = yesterday.strftime('%Y-%m-%d')
 
     suffixes = [
-        f'-{today}.jsonl'
+        (f'-{today}.jsonl', True)
     ]
 
     if not glob.glob(f"*-{today}.jsonl", root_dir=opts.eddndir):
         suffixes = [
-            f'-{yesterday}.jsonl',
-            f'-{today}.jsonl'
+            (f'-{yesterday}.jsonl', False),
+            (f'-{today}.jsonl', True)
         ]
 
-    for suffix in suffixes:
-        if init_local_files(opts.eddndir, suffix):
+    for suffix, is_today in suffixes:
+        if init_local_files(opts.eddndir, suffix) or is_today:
             if opts.mirror_url is not None:
                 sync_mirror_url(
                     opts.mirror_url,
